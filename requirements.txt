@@ -1,0 +1,8 @@
+streamlit
+transformers
+torch
+pypdf
+pandas
+sentencepiece
+accelerate
+protobuf

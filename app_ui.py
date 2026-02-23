@@ -6,8 +6,11 @@ import pandas as pd
 import re
 
 # ===================== CONFIG =====================
-CLASSIFIER_MODEL = "facebook/bart-large-mnli"
-EXPLAINER_MODEL = "google/flan-t5-large" 
+# Swapped to 'distilbart' (Much smaller, still very smart)
+CLASSIFIER_MODEL = "valhalla/distilbart-mnli-12-3" 
+
+# Swapped back to 'base' so it fits in the 1GB cloud RAM limit
+EXPLAINER_MODEL = "google/flan-t5-base"  
 
 RISK_CATEGORIES = [
     "Data Privacy & Tracking",
@@ -16,149 +19,163 @@ RISK_CATEGORIES = [
     "Unilateral Account Termination",
     "Intellectual Property Surrender"
 ]
-
-# BATCH SIZE: Number of clauses to process at once.
-# If you have >8GB RAM, you can increase this to 16 or 32.
-BATCH_SIZE = 8 
 # =================================================
 
-st.set_page_config(page_title="The Fine Print Auditor", page_icon="⚖️", layout="wide")
+# --- PAGE SETUP ---
+st.set_page_config(
+    page_title="The Fine Print Auditor",
+    page_icon="⚖️",
+    layout="wide"
+)
 
+# --- CACHED MODEL LOADING (CRITICAL) ---
+# We use @st.cache_resource so models load ONCE and stay in memory.
+# Without this, the app would reload the 2GB models on every click!
 @st.cache_resource
 def load_models():
     device = 0 if torch.cuda.is_available() else -1
     
-    # 1. Load Classifier (The Judge)
+    # 1. Load Classifier
     classifier = pipeline("zero-shot-classification", model=CLASSIFIER_MODEL, device=device)
     
-    # 2. Load Explainer (The Translator)
+    # 2. Load Explainer
     tokenizer = AutoTokenizer.from_pretrained(EXPLAINER_MODEL)
-    model = AutoModelForSeq2SeqLM.from_pretrained(EXPLAINER_MODEL)
+    explainer_model = AutoModelForSeq2SeqLM.from_pretrained(EXPLAINER_MODEL)
     if device == 0:
-        model = model.to("cuda")
+        explainer_model = explainer_model.to("cuda")
         
-    return classifier, tokenizer, model, device
+    return classifier, tokenizer, explainer_model, device
 
+# --- HELPER FUNCTIONS ---
 def extract_text(uploaded_file):
+    """Handles both PDF and TXT file uploads."""
     try:
         if uploaded_file.name.endswith('.pdf'):
             reader = PdfReader(uploaded_file)
-            return "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
+            text = ""
+            for page in reader.pages:
+                text += page.extract_text() + "\n"
+            return text
         else:
+            # Assume text file
             return uploaded_file.read().decode("utf-8")
     except Exception as e:
         st.error(f"Error reading file: {e}")
         return None
 
 def segment_text(text):
-    # Clean and split into chunks
+    """Clean and split text into clauses."""
     text = re.sub(r'\s+', ' ', text).strip()
     sentences = re.split(r'(?<=[.!?])\s+', text)
     return [s.strip() for s in sentences if len(s.split()) > 8]
 
-def explain_risk_batch(clauses, model, tokenizer, device):
-    """
-    Generates explanations for a LIST of clauses at once.
-    """
-    prompts = [
-        f"Explain this legal clause in simple English focusing on the risk: {c}" 
-        for c in clauses
-    ]
+def explain_risk(clause, model, tokenizer, device):
+    prompt = (
+        f"Explain the following legal clause in plain English. "
+        f"Focus on the risk to the user.\n\n"
+        f"Legal Clause: {clause}\n\n"
+        f"Plain English Explanation:"
+    )
     
-    inputs = tokenizer(prompts, return_tensors="pt", max_length=512, truncation=True, padding=True)
+    inputs = tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
     if device == 0:
         inputs = {k: v.to("cuda") for k, v in inputs.items()}
 
     outputs = model.generate(
-        **inputs, 
-        max_new_tokens=60, 
-        do_sample=False, 
-        repetition_penalty=1.5
+        **inputs, max_new_tokens=80, do_sample=True, 
+        temperature=0.7, repetition_penalty=1.5, early_stopping=True
     )
-    
-    return tokenizer.batch_decode(outputs, skip_special_tokens=True)
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
+# --- MAIN APP UI ---
 def main():
+    # Sidebar
     st.sidebar.title("⚙️ Settings")
-    threshold = st.sidebar.slider("Risk Threshold", 0.4, 0.9, 0.60)
+    st.sidebar.info("Models loaded & ready.")
+    threshold = st.sidebar.slider("Risk Sensitivity", 0.4, 0.9, 0.60)
     
-    st.title("⚡ The Fine Print: High-Speed Auditor")
-    st.markdown("**Upload a contract to scan for risks instantly.**")
+    # Main Content
+    st.title("⚖️ The Fine Print: AI Legal Auditor")
+    st.markdown("""
+    **Don't sign what you don't understand.** Upload a Contract, Terms of Service, or Privacy Policy to detect potential traps.
+    """)
 
-    # Load models
-    with st.spinner("Loading AI Engines..."):
+    # 1. Load Models (Cached)
+    with st.spinner("Waking up the AI... (First run takes 30s)"):
         classifier, tokenizer, explainer_model, device = load_models()
 
-    uploaded_file = st.file_uploader("Upload PDF or TXT", type=['txt', 'pdf'])
+    # 2. File Uploader
+    uploaded_file = st.file_uploader("Drop your document here (PDF or TXT)", type=['txt', 'pdf'])
 
     if uploaded_file:
+        # Extract Text
         text = extract_text(uploaded_file)
+        
         if text:
-            clauses = segment_text(text)
-            st.info(f"Document loaded. Found {len(clauses)} clauses.")
+            st.success(f"File loaded! Found {len(text)} characters.")
             
-            if st.button("🚀 Run Fast Scan"):
+            if st.button("🔍 Scan for Risks"):
+                clauses = segment_text(text)
                 results = []
-                progress_bar = st.progress(0)
-                status = st.empty()
-
-                # --- BATCH PROCESSING LOOP ---
-                total_batches = (len(clauses) + BATCH_SIZE - 1) // BATCH_SIZE
                 
-                for i in range(0, len(clauses), BATCH_SIZE):
-                    batch = clauses[i : i + BATCH_SIZE]
+                # Progress Bar
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                for i, clause in enumerate(clauses):
+                    # Update progress
+                    progress = (i + 1) / len(clauses)
+                    progress_bar.progress(progress)
+                    status_text.text(f"Scanning clause {i+1}/{len(clauses)}...")
                     
-                    # update progress
-                    current_batch = (i // BATCH_SIZE) + 1
-                    progress_bar.progress(current_batch / total_batches)
-                    status.text(f"Processing Batch {current_batch}/{total_batches}...")
-
-                    # 1. Bulk Classify
-                    # We send the whole list 'batch' to the classifier at once
-                    batch_results = classifier(batch, candidate_labels=RISK_CATEGORIES + ["Neutral"])
+                    # AI Analysis
+                    output = classifier(clause, candidate_labels=RISK_CATEGORIES + ["Neutral"])
+                    top_label = output['labels'][0]
+                    score = output['scores'][0]
                     
-                    risky_clauses = []
-                    risky_indices = []
-
-                    # 2. Filter for Risks
-                    for idx, res in enumerate(batch_results):
-                        top_label = res['labels'][0]
-                        score = res['scores'][0]
-                        
-                        if top_label != "Neutral" and score >= threshold:
-                            risky_clauses.append(batch[idx])
-                            risky_indices.append((top_label, score))
-
-                    # 3. Bulk Explain (Only the risky ones)
-                    if risky_clauses:
-                        explanations = explain_risk_batch(risky_clauses, explainer_model, tokenizer, device)
-                        
-                        for j, explanation in enumerate(explanations):
-                            label, score = risky_indices[j]
-                            results.append({
-                                "Risk Type": label,
-                                "Confidence": score,
-                                "Clause": risky_clauses[j],
-                                "Explanation": explanation
-                            })
-
+                    if top_label != "Neutral" and score >= threshold:
+                        explanation = explain_risk(clause, explainer_model, tokenizer, device)
+                        results.append({
+                            "Risk Type": top_label,
+                            "Confidence": score,
+                            "Clause": clause,
+                            "Explanation": explanation
+                        })
+                
+                status_text.text("Scan Complete!")
                 progress_bar.empty()
-                status.empty()
-
-                # --- DISPLAY ---
+                
+                # --- RESULTS DISPLAY ---
                 if results:
-                    st.success(f"Scan Complete! Found {len(results)} risks.")
+                    st.divider()
+                    st.subheader(f"🚨 Detected {len(results)} Potential Risks")
                     
+                    # Convert to DataFrame for CSV download
                     df = pd.DataFrame(results)
-                    st.dataframe(df[["Risk Type", "Confidence", "Explanation"]]) # Quick view table
+                    csv = df.to_csv(index=False).encode('utf-8')
                     
+                    st.download_button(
+                        "📥 Download Full Report (CSV)", 
+                        data=csv, 
+                        file_name="legal_risk_report.csv", 
+                        mime="text/csv"
+                    )
+                    
+                    # Display Cards for each risk
                     for item in results:
-                        with st.expander(f"🚩 {item['Risk Type']} ({item['Confidence']:.1%})"):
-                            st.write(f"**Explanation:** {item['Explanation']}")
-                            st.caption(f"**Original:** {item['Clause']}")
+                        with st.expander(f"🚩 {item['Risk Type'].upper()} ({item['Confidence']:.0%})", expanded=True):
+                            col1, col2 = st.columns([1, 1])
+                            
+                            with col1:
+                                st.markdown("**📜 Original Text**")
+                                st.caption(item['Clause'])
+                                
+                            with col2:
+                                st.markdown("**🗣️ Simple English**")
+                                st.error(item['Explanation'])
                 else:
                     st.balloons()
-                    st.success("✅ No risks found.")
+                    st.success("✅ No significant risks found! This document looks safe.")
 
 if __name__ == "__main__":
     main()
