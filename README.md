@@ -6,8 +6,15 @@ pip install sentencepiece
 
 pip install sentencepiece accelerate protobuf
 
+OR
+
+pip install -r requirements.txt
+
 ---------------------------------------------------------------------
 
 **Then Run:**
-python app.py
-(app_ui.py requires fine tuning)
+python app.py(for cli based testing)
+
+OR
+
+streamlit run app_ui.py(for ui frontend testing) 
