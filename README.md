@@ -13,6 +13,7 @@ pip install -r requirements.txt
 ---------------------------------------------------------------------
 
 **Then Run:**
+
 python app.py(for cli based testing)
 
 OR
